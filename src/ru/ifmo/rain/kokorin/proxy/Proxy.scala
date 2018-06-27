@@ -3,10 +3,10 @@ package ru.ifmo.rain.kokorin.proxy
 object Proxy {
     def main(args: Array[String]): Unit = {
 
-        if (args.length != 1) {
+        if (args.length != 2) {
             println(
                 "running:\n" +
-                "Proxy <config file>\n" +
+                "Proxy <config file> <number of threads>\n" +
                 "file format:\n" +
                 "<local port> <remote ip-address> <remote port>"
             )
@@ -14,7 +14,7 @@ object Proxy {
         }
 
         try {
-            val server = new ProxyServer
+            val server = new ProxyServer(Integer.parseInt(args(1)))
 
             new Thread(
                 () => {
