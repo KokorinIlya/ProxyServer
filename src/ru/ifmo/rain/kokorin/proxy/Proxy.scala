@@ -1,5 +1,7 @@
 package ru.ifmo.rain.kokorin.proxy
 
+import java.util.Scanner
+
 object Proxy {
     def main(args: Array[String]): Unit = {
 
@@ -18,9 +20,10 @@ object Proxy {
 
             new Thread(
                 () => {
-                    Thread.sleep(10000)
+                    println("Type 'close' for closing")
+                    val scanner = new Scanner(System.in)
+                    while (scanner.next() != "close") {}
                     server.close()
-                    println("Closed")
                 }
             ).start()
 

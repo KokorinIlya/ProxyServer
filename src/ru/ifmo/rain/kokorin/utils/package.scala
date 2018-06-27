@@ -1,7 +1,8 @@
 package ru.ifmo.rain.kokorin
 
 package object utils {
-    def withResources[T <: AutoCloseable, R](resource: T)(f: T => R): R = {
+    def withResources[T <: AutoCloseable, R](getRes: => T)(f: T => R): R = {
+        val resource = getRes
         try {
             val result = f(resource)
             resource.close()

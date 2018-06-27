@@ -1,27 +1,28 @@
 package ru.ifmo.rain.kokorin.proxy
 
 import java.io.IOException
-import java.net.{InetAddress, InetSocketAddress}
+import java.net.{InetAddress, InetSocketAddress, Socket, SocketAddress}
 import java.nio.channels._
 import java.nio.file.{Files, Paths}
-import java.util.concurrent.Executors
+import java.util.concurrent.{Executors, TimeUnit}
 
 import ru.ifmo.rain.kokorin.utils.withResources
 
 import scala.collection.concurrent.TrieMap
 import scala.collection.immutable.HashSet
-import scala.collection.Set
+import scala.collection.{Set, mutable}
 
 class ProxyServer (threads: Int) extends AutoCloseable {
 
     private val awaitAcceptSelector = Selector.open()
     private var isOpened = false
 
+    // Closable resources
     private var listeners: Set[SelectableChannel] = new HashSet[SelectableChannel]
     private var sockets: Set[SocketChannel] = new TrieMap[SocketChannel, Unit].keySet
 
     private val threadPool = Executors.newFixedThreadPool(threads)
-
+    private val remoteAddressMap = mutable.Map[Int, SocketAddress]()
 
     private def processLine(line: String): Unit = {
         val parts = line.split(" ")
@@ -31,6 +32,19 @@ class ProxyServer (threads: Int) extends AutoCloseable {
                 "Incorrect file format: " + line
             )
         }
+
+        val (localPort, remoteHost, remotePort) = (
+            Integer.parseInt(parts(0)),
+            parts(1),
+            Integer.parseInt(parts(2))
+        )
+
+        remoteAddressMap += (
+            localPort -> new InetSocketAddress(
+                InetAddress.getByName(remoteHost),
+                remotePort
+            )
+        )
 
         val curChannel = ServerSocketChannel.open().bind(
             new InetSocketAddress(
@@ -47,7 +61,28 @@ class ProxyServer (threads: Int) extends AutoCloseable {
             awaitAcceptSelector,
             SelectionKey.OP_ACCEPT
         )
+    }
 
+    private def processConnection(socket: SocketChannel): Unit = {
+        val localPort = socket.socket().getLocalPort
+        val remoteAddress = remoteAddressMap(localPort)
+
+
+        println(remoteAddress)
+
+        //TODO
+        withResources(
+            new Socket()
+        ) {
+            remoteSocket => {
+                println("Started")
+                remoteSocket.connect(remoteAddress)
+                println("Connected")
+                val x = socket.socket().getInputStream.read()
+                println(x)
+                remoteSocket.getOutputStream.write(x)
+            }
+        }
     }
 
     def start(fileName: String): Unit = {
@@ -83,7 +118,8 @@ class ProxyServer (threads: Int) extends AutoCloseable {
                     println(s"New client connection: $socketChannel")
                     sockets += socketChannel
 
-                    //TODO
+                    val task: Runnable = () => processConnection(socketChannel)
+                    threadPool.submit(task)
 
                 } catch {
                     case e: IOException => System.err.println(
@@ -127,6 +163,9 @@ class ProxyServer (threads: Int) extends AutoCloseable {
     override def close(): Unit = {
         isOpened = false
         awaitAcceptSelector.close()
+
+        threadPool.shutdownNow()
+        threadPool.awaitTermination(1, TimeUnit.MINUTES)
 
         closeAll(listeners) match {
             case None => closeAll(sockets) match {
