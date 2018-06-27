@@ -11,7 +11,7 @@ object Client {
                 1337
             )
         )
-        Thread.sleep(5000)
+        Thread.sleep(1000)
         socket.close()
     }
 }

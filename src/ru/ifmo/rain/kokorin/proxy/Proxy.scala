@@ -14,7 +14,18 @@ object Proxy {
         }
 
         try {
-            new ProxyServer().start(args(0))
+            val server = new ProxyServer
+
+            new Thread(
+                () => {
+                    Thread.sleep(10000)
+                    server.close()
+                    println("Closed")
+                }
+            ).start()
+
+            server.start(args(0))
+
         } catch {
             case e: Exception => println(e.getMessage)
         }
