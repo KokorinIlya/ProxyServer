@@ -4,13 +4,13 @@ import java.io.IOException
 import java.net._
 import java.nio.ByteBuffer
 import java.nio.channels._
-import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 import java.util
 import java.util.concurrent.{Executors, TimeUnit}
 
 import ru.ifmo.rain.kokorin.utils.withResources
 
+import scala.annotation.tailrec
 import scala.collection.concurrent.TrieMap
 import scala.collection.immutable.HashSet
 import scala.collection.{Set, mutable}
@@ -66,94 +66,104 @@ class ProxyServer (threads: Int) extends AutoCloseable {
         )
     }
 
-    private def processConnection(clientChannel: SocketChannel): Unit = {
 
-        def closeClientConnection(): Unit = {
-            sockets -= clientChannel
-            clientChannel.close()
-        }
+    //TODO remove return
+    //TODO error handling
+    private def getSize(s: Socket) = Math.max(s.getReceiveBufferSize, s.getSendBufferSize)
 
-        val localPort = clientChannel.socket().getLocalPort
-        val remoteAddress = remoteAddressMap(localPort)
+    private def processImpl(clientChannel: SocketChannel,
+                            remoteAddress: SocketAddress): Unit =
+        withResources(Selector.open()) {
+        selector => {
+            withResources(SocketChannel.open()) {
+                remoteChannel => try {
+                    remoteChannel.socket().connect(remoteAddress, 1)
 
-        def getSize(s: Socket) = Math.max(s.getReceiveBufferSize, s.getSendBufferSize)
+                    var clientClosedConnection = false
+                    var remoteClosedConnection = false
 
-        def processImpl(): Unit = withResources(Selector.open()) {
-            selector => {
-                withResources(SocketChannel.open()) {
-                    remoteChannel => {
+                    remoteChannel.configureBlocking(false)
+                    clientChannel.configureBlocking(false)
 
-                        try {
-                            remoteChannel.socket().connect(remoteAddress, 1)
-                        } catch {
-                            case e: ConnectException => {
-                                closeClientConnection()
-                                return
+                    val (remoteBuffer, clientBuffer) = (
+                        ByteBuffer.allocate(getSize(remoteChannel.socket())),
+                        ByteBuffer.allocate(getSize(clientChannel.socket()))
+                    )
+
+                    // Queue for sending TO client and TO remote server
+                    val clientDeque = new util.ArrayDeque[Array[Byte]]()
+                    val remoteDeque = new util.ArrayDeque[Array[Byte]]()
+
+                    remoteChannel.register(selector, SelectionKey.OP_READ)
+                    clientChannel.register(selector, SelectionKey.OP_READ)
+
+                    @tailrec
+                    def selectorLoop(): Unit = {
+                        selector.select()
+                        val iter = selector.selectedKeys().iterator()
+
+                        while (iter.hasNext) {
+                            val key = iter.next()
+
+                            if (key.channel() == remoteChannel) {
+                                remoteClosedConnection |= processEvent(
+                                    remoteChannel,
+                                    remoteDeque,
+                                    remoteBuffer,
+                                    clientChannel,
+                                    clientDeque,
+                                    clientBuffer,
+                                    key,
+                                    selector
+                                )
+                            } else {
+                                clientClosedConnection |= processEvent(
+                                    clientChannel,
+                                    clientDeque,
+                                    clientBuffer,
+                                    remoteChannel,
+                                    remoteDeque,
+                                    remoteBuffer,
+                                    key,
+                                    selector
+                                )
                             }
+                            iter.remove()
                         }
 
-                        var clientCLosedConnection = false
-                        var remoteCLosedConection = false
+                        if (
+                            clientClosedConnection &&
+                                remoteClosedConnection
+                        ) () else selectorLoop()
+                    }
 
-                        remoteChannel.configureBlocking(false)
-                        clientChannel.configureBlocking(false)
-
-                        val (remoteBuffer, clientBuffer) = (
-                            ByteBuffer.allocate(getSize(remoteChannel.socket())),
-                            ByteBuffer.allocate(getSize(clientChannel.socket()))
-                        )
-
-                        // Queue for sending TO client and TO remote server
-                        val clientDeque = new util.ArrayDeque[Array[Byte]]()
-                        val remoteDeque = new util.ArrayDeque[Array[Byte]]()
-
-                        remoteChannel.register(selector, SelectionKey.OP_READ)
-                        clientChannel.register(selector, SelectionKey.OP_READ)
-
-                        while (true) {
-                            selector.select()
-                            val iter = selector.selectedKeys().iterator()
-
-                            while (iter.hasNext) {
-                                val key = iter.next()
-
-                                if (key.channel() == remoteChannel) {
-                                    remoteCLosedConection |= processEvent(
-                                        remoteChannel,
-                                        remoteDeque,
-                                        remoteBuffer,
-                                        clientChannel,
-                                        clientDeque,
-                                        clientBuffer,
-                                        key,
-                                        selector
-                                    )
-                                } else {
-                                    clientCLosedConnection |= processEvent(
-                                        clientChannel,
-                                        clientDeque,
-                                        clientBuffer,
-                                        remoteChannel,
-                                        remoteDeque,
-                                        remoteBuffer,
-                                        key,
-                                        selector
-                                    )
-                                }
-                                iter.remove()
-                            }
-
-                            if (clientCLosedConnection && remoteCLosedConection) {
-                                closeClientConnection()
-                                return
-                            }
-                        }
+                    selectorLoop()
+                } catch {
+                    case e: ConnectException => {
+                        println(s"Cannot connect to server; ${e.getMessage}")
+                        ()
                     }
                 }
             }
         }
+    }
 
-        processImpl()
+    private def processConnection(clientChannel: SocketChannel): Unit = {
+
+        val localPort = clientChannel.socket().getLocalPort
+        val remoteAddress = remoteAddressMap(localPort)
+
+        try {
+            withResources(clientChannel) {
+                clientChannel => processImpl(clientChannel, remoteAddress)
+            }
+        } catch {
+            case e: IOException =>
+                println(s"Error while handling connection: ${e.getMessage}")
+        } finally {
+            sockets -= clientChannel
+        }
+
         println(s"Finished connection for client $clientChannel")
 
     }
@@ -167,40 +177,40 @@ class ProxyServer (threads: Int) extends AutoCloseable {
         otherBuffer: ByteBuffer,
         key: SelectionKey,
         selector: Selector
-    ): Boolean = {
-        if (key.isReadable) {
-            buffer.clear()
-            if (channel.read(buffer) == -1) {
-                return true
-            }
-            buffer.flip()
-            val arr = new Array[Byte](buffer.remaining())
-            buffer.get(arr)
-            otherDeque.addFirst(arr)
-            buffer.clear
-            if (otherDeque.size == 1) {
-                otherChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE)
-            }
-        }
-        if (key.isWritable) {
-            buffer.clear()
+    ) = {
+        buffer.clear()
 
-            buffer.put(deque.removeLast())
-            buffer.flip()
-            if (channel.write(buffer) == -1) {
-                return true
-            }
-            if (buffer.remaining > 0) {
+        def processReadEvent() =
+            if (!key.isReadable) false else
+                if (channel.read(buffer) == -1) true else {
+                buffer.flip()
                 val arr = new Array[Byte](buffer.remaining())
                 buffer.get(arr)
-                deque.addLast(arr)
+                otherDeque.addFirst(arr)
+                if (otherDeque.size == 1) {
+                    otherChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE)
+                }
+                false
             }
-            if (deque.isEmpty) {
-                channel.register(selector, SelectionKey.OP_READ)
+
+        def processWriteEvent() =
+            if (!key.isWritable) false else {
+                buffer.put(deque.removeLast())
+                buffer.flip()
+                if (channel.write(buffer) == -1) true else {
+                    if (buffer.remaining > 0) {
+                        val arr = new Array[Byte](buffer.remaining())
+                        buffer.get(arr)
+                        deque.addLast(arr)
+                    }
+                    if (deque.isEmpty) {
+                        channel.register(selector, SelectionKey.OP_READ)
+                    }
+                    false
+                }
             }
-            buffer.clear()
-        }
-        return false
+
+        processReadEvent() || processWriteEvent()
     }
 
     def start(fileName: String): Unit = {
