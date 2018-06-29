@@ -66,8 +66,6 @@ class ProxyServer (threads: Int) extends AutoCloseable {
         )
     }
 
-
-    //TODO remove return
     //TODO error handling
     private def getSize(s: Socket) = Math.max(s.getReceiveBufferSize, s.getSendBufferSize)
 
@@ -102,6 +100,9 @@ class ProxyServer (threads: Int) extends AutoCloseable {
                         selector.select()
                         val iter = selector.selectedKeys().iterator()
 
+                        /*
+                        TODO : remove while's, check if remove() is needed
+                         */
                         while (iter.hasNext) {
                             val key = iter.next()
 
@@ -132,8 +133,9 @@ class ProxyServer (threads: Int) extends AutoCloseable {
                         }
 
                         if (
-                            clientClosedConnection &&
-                                remoteClosedConnection
+                            (clientClosedConnection && !remoteChannel.keyFor(selector).isWritable) ||
+                                (remoteClosedConnection && !clientChannel.keyFor(selector).isWritable) ||
+                                (clientClosedConnection && remoteClosedConnection)
                         ) () else selectorLoop()
                     }
 
@@ -149,7 +151,6 @@ class ProxyServer (threads: Int) extends AutoCloseable {
     }
 
     private def processConnection(clientChannel: SocketChannel): Unit = {
-
         val localPort = clientChannel.socket().getLocalPort
         val remoteAddress = remoteAddressMap(localPort)
 
@@ -182,7 +183,10 @@ class ProxyServer (threads: Int) extends AutoCloseable {
 
         def processReadEvent() =
             if (!key.isReadable) false else
-                if (channel.read(buffer) == -1) true else {
+                if (channel.read(buffer) == -1) {
+                println("finished")
+                true
+            } else {
                 buffer.flip()
                 val arr = new Array[Byte](buffer.remaining())
                 buffer.get(arr)
@@ -225,38 +229,41 @@ class ProxyServer (threads: Int) extends AutoCloseable {
             }
         }
 
-        while (isOpened && !Thread.interrupted()) {
+        @tailrec
+        def selectionLoop(): Unit = {
             awaitAcceptSelector.select()
 
-            if (!isOpened || Thread.interrupted()) {
-                return
-            }
+            if (!isOpened || Thread.interrupted()) () else {
+                val iter = awaitAcceptSelector.selectedKeys().iterator()
+                while (iter.hasNext) {
+                    val key = iter.next()
+                    require(key.isAcceptable)
 
-            val iter = awaitAcceptSelector.selectedKeys().iterator()
-            while (iter.hasNext) {
-                val key = iter.next()
-                require(key.isAcceptable)
+                    val serverChannel = key.channel().asInstanceOf[ServerSocketChannel]
 
-                val serverChannel = key.channel().asInstanceOf[ServerSocketChannel]
+                    try {
+                        val socketChannel = serverChannel.accept()
+                        println(s"New client connection: $socketChannel")
+                        sockets += socketChannel
 
-                try {
-                    val socketChannel = serverChannel.accept()
-                    println(s"New client connection: $socketChannel")
-                    sockets += socketChannel
+                        val task: Runnable = () => processConnection(socketChannel)
+                        threadPool.submit(task)
 
-                    val task: Runnable = () => processConnection(socketChannel)
-                    threadPool.submit(task)
+                    } catch {
+                        case e: IOException => System.err.println(
+                            s"Accept error on channel $serverChannel" +
+                                s" has occurred; ${e.getMessage}"
+                        )
+                    }
 
-                } catch {
-                    case e: IOException => System.err.println(
-                        s"Accept error on channel $serverChannel" +
-                            s" has occurred; ${e.getMessage}"
-                    )
+                    iter.remove()
                 }
-
-                iter.remove()
             }
+
+            if (isOpened && !Thread.interrupted()) selectionLoop() else ()
         }
+
+        selectionLoop()
 
     }
 
